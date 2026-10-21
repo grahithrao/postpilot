@@ -1,0 +1,630 @@
+// PostPilot — AI Social Media Agent
+// Full post lifecycle: generation -> AI review -> HUMAN APPROVAL -> schedule -> publish -> track
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  ADMIN
+  EDITOR
+  VIEWER
+}
+
+enum Platform {
+  INSTAGRAM
+  LINKEDIN
+  X
+  FACEBOOK
+}
+
+/// Canonical post lifecycle. Transitions are enforced in src/lib/services/post-status.ts
+enum PostStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  SCHEDULED
+  PUBLISHING
+  PUBLISHED
+  FAILED
+  ARCHIVED
+}
+
+enum ContentType {
+  SOCIAL_POST
+  PROMOTIONAL
+  EDUCATIONAL
+  ANNOUNCEMENT
+  PRODUCT_LAUNCH
+  EVENT_PROMOTION
+  ENGAGEMENT
+}
+
+enum Tone {
+  PROFESSIONAL
+  CASUAL
+  FRIENDLY
+  WITTY
+  INSPIRATIONAL
+  AUTHORITATIVE
+  EMPATHETIC
+  BOLD
+}
+
+enum ContentLength {
+  SHORT
+  MEDIUM
+  LONG
+}
+
+enum RevisionSource {
+  AI_GENERATED
+  AI_IMPROVED
+  AI_SHORTENED
+  AI_EXPANDED
+  AI_TONE_SHIFT
+  AI_REWRITE
+  AI_REGENERATED
+  HUMAN_EDIT
+  AUTOMATION
+}
+
+enum ApprovalDecision {
+  APPROVED
+  REJECTED
+  CHANGES_REQUESTED
+  REGENERATION_REQUESTED
+}
+
+enum SocialAccountStatus {
+  CONNECTED
+  DISCONNECTED
+  TOKEN_EXPIRED
+  ERROR
+}
+
+enum ScheduleStatus {
+  PENDING
+  QUEUED
+  PUBLISHING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum PublishLogStatus {
+  ATTEMPT
+  SUCCESS
+  FAILURE
+  RETRY_SCHEDULED
+  BLOCKED
+  SKIPPED_DUPLICATE
+}
+
+enum AutomationFrequency {
+  HOURLY
+  DAILY
+  WEEKLY
+  BIWEEKLY
+  MONTHLY
+}
+
+enum AutomationRunStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+  SKIPPED
+}
+
+enum AgentRunStatus {
+  RUNNING
+  AWAITING_APPROVAL
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum ActivityType {
+  POST_CREATED
+  POST_GENERATED
+  POST_EDITED
+  POST_SUBMITTED
+  POST_APPROVED
+  POST_REJECTED
+  POST_CHANGES_REQUESTED
+  POST_REGENERATED
+  POST_SCHEDULED
+  POST_RESCHEDULED
+  POST_SCHEDULE_CANCELLED
+  POST_PUBLISHING
+  POST_PUBLISHED
+  POST_FAILED
+  POST_DELETED
+  POST_DUPLICATED
+  PUBLISH_BLOCKED
+  ACCOUNT_CONNECTED
+  ACCOUNT_DISCONNECTED
+  ACCOUNT_SYNCED
+  AUTOMATION_CREATED
+  AUTOMATION_UPDATED
+  AUTOMATION_RUN
+  AUTOMATION_DELETED
+  USER_LOGIN
+}
+
+enum NotificationType {
+  APPROVAL_REQUESTED
+  POST_APPROVED
+  POST_REJECTED
+  POST_PUBLISHED
+  POST_FAILED
+  AUTOMATION_RUN
+  SYSTEM
+}
+
+// ---------------------------------------------------------------------------
+// Auth (Auth.js / NextAuth compatible)
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  name          String?
+  image         String?
+  passwordHash  String?
+  role          UserRole  @default(ADMIN)
+  timezone      String    @default("UTC")
+  emailVerified DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  accounts       Account[]
+  sessions       Session[]
+  socialAccounts SocialAccount[]
+  posts          Post[]
+  revisions      PostRevision[]
+  approvals      Approval[]      @relation("ApprovalReviewer")
+  schedules      Schedule[]
+  automations    Automation[]
+  activityLogs   ActivityLog[]
+  notifications  Notification[]
+  agentRuns      AgentRun[]
+
+  @@index([email])
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ---------------------------------------------------------------------------
+// Social integrations
+// ---------------------------------------------------------------------------
+
+/// A connected (or demo) social profile. OAuth tokens are stored encrypted
+/// at rest (AES-256-GCM, see src/lib/security/crypto.ts) and NEVER leave the server.
+model SocialAccount {
+  id                String              @id @default(cuid())
+  userId            String
+  platform          Platform
+  platformAccountId String
+  handle            String
+  displayName       String
+  avatarUrl         String?
+  status            SocialAccountStatus @default(CONNECTED)
+  /// True when this connection is simulated by DEMO MODE rather than a real OAuth grant.
+  isDemo            Boolean             @default(true)
+  accessTokenEnc    String?             @db.Text
+  refreshTokenEnc   String?             @db.Text
+  tokenExpiresAt    DateTime?
+  scopes            String[]            @default([])
+  followerCount     Int                 @default(0)
+  lastSyncedAt      DateTime?
+  metadata          Json?
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  posts       Post[]
+  schedules   Schedule[]
+  automations Automation[]
+
+  @@unique([userId, platform, platformAccountId])
+  @@index([userId, platform])
+}
+
+// ---------------------------------------------------------------------------
+// Content
+// ---------------------------------------------------------------------------
+
+model Post {
+  id     String @id @default(cuid())
+  userId String
+
+  // Brief / request context
+  topic       String
+  product     String?
+  audience    String?
+  contentType ContentType   @default(SOCIAL_POST)
+  tone        Tone          @default(PROFESSIONAL)
+  length      ContentLength @default(MEDIUM)
+  language    String        @default("English")
+  keywords    String[]      @default([])
+  ctaRequest  String?
+  notes       String?       @db.Text
+
+  // Generated / edited content
+  platform        Platform
+  socialAccountId String?
+  headline        String?
+  caption         String    @db.Text
+  hashtags        String[]  @default([])
+  cta             String?
+  imagePrompt     String?   @db.Text
+  mediaUrl        String?
+  suggestedTime   DateTime?
+
+  // Lifecycle
+  status        PostStatus @default(DRAFT)
+  version       Int        @default(1)
+  qualityScore  Float?
+  qualityReport Json?
+
+  // AI provenance
+  aiProvider  String?
+  aiModel     String?
+  generatedMs Int?
+
+  // Publishing outcome
+  publishedAt     DateTime?
+  publishedUrl    String?
+  externalId      String?
+  failureReason   String?   @db.Text
+  publishAttempts Int       @default(0)
+
+  automationId String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  socialAccount SocialAccount? @relation(fields: [socialAccountId], references: [id], onDelete: SetNull)
+  automation    Automation?    @relation(fields: [automationId], references: [id], onDelete: SetNull)
+
+  revisions      PostRevision[]
+  approvals      Approval[]
+  schedules      Schedule[]
+  publishingLogs PublishingLog[]
+  activityLogs   ActivityLog[]
+  agentRuns      AgentRun[]
+  analytics      AnalyticsSnapshot[]
+  automationRuns AutomationRun[]
+
+  @@index([userId, status])
+  @@index([userId, platform])
+  @@index([userId, createdAt])
+  @@index([status])
+}
+
+/// Immutable audit trail of every content change (AI or human).
+model PostRevision {
+  id            String         @id @default(cuid())
+  postId        String
+  version       Int
+  source        RevisionSource
+  changeSummary String?
+  authorId      String?
+  headline      String?
+  caption       String         @db.Text
+  hashtags      String[]       @default([])
+  cta           String?
+  imagePrompt   String?        @db.Text
+  qualityScore  Float?
+  snapshot      Json?
+  createdAt     DateTime       @default(now())
+
+  post   Post  @relation(fields: [postId], references: [id], onDelete: Cascade)
+  author User? @relation(fields: [authorId], references: [id], onDelete: SetNull)
+
+  @@unique([postId, version])
+  @@index([postId, createdAt])
+}
+
+/// Every human decision on a post. Nothing publishes without an APPROVED row here.
+model Approval {
+  id                     String           @id @default(cuid())
+  postId                 String
+  reviewerId             String
+  decision               ApprovalDecision
+  feedback               String?          @db.Text
+  qualityScoreAtDecision Float?
+  postVersion            Int
+  createdAt              DateTime         @default(now())
+
+  post     Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+  reviewer User @relation("ApprovalReviewer", fields: [reviewerId], references: [id], onDelete: Cascade)
+
+  @@index([postId, createdAt])
+  @@index([reviewerId])
+}
+
+// ---------------------------------------------------------------------------
+// Scheduling & publishing
+// ---------------------------------------------------------------------------
+
+model Schedule {
+  id              String         @id @default(cuid())
+  postId          String
+  userId          String
+  socialAccountId String
+  scheduledFor    DateTime
+  timezone        String         @default("UTC")
+  status          ScheduleStatus @default(PENDING)
+
+  attempts      Int       @default(0)
+  maxAttempts   Int       @default(3)
+  lastAttemptAt DateTime?
+  nextAttemptAt DateTime?
+  lastError     String?   @db.Text
+
+  /// Worker lease — prevents two workers from picking up the same job.
+  leaseId  String?
+  leasedAt DateTime?
+
+  /// Guarantees a scheduled post is published at most once.
+  idempotencyKey String    @unique
+  completedAt    DateTime?
+  cancelledAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  post          Post          @relation(fields: [postId], references: [id], onDelete: Cascade)
+  user          User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  socialAccount SocialAccount @relation(fields: [socialAccountId], references: [id], onDelete: Cascade)
+
+  publishingLogs PublishingLog[]
+
+  @@index([status, scheduledFor])
+  @@index([postId])
+  @@index([userId, scheduledFor])
+}
+
+model PublishingLog {
+  id          String           @id @default(cuid())
+  postId      String
+  scheduleId  String?
+  platform    Platform
+  status      PublishLogStatus
+  attempt     Int              @default(1)
+  message     String           @db.Text
+  errorCode   String?
+  externalId  String?
+  externalUrl String?
+  latencyMs   Int?
+  request     Json?
+  response    Json?
+  createdAt   DateTime         @default(now())
+
+  post     Post      @relation(fields: [postId], references: [id], onDelete: Cascade)
+  schedule Schedule? @relation(fields: [scheduleId], references: [id], onDelete: SetNull)
+
+  @@index([postId, createdAt])
+  @@index([scheduleId])
+}
+
+// ---------------------------------------------------------------------------
+// Automation
+// ---------------------------------------------------------------------------
+
+model Automation {
+  id          String  @id @default(cuid())
+  userId      String
+  name        String
+  description String?
+
+  frequency  AutomationFrequency @default(WEEKLY)
+  /// 0-6, Sunday = 0. Used by WEEKLY / BIWEEKLY.
+  dayOfWeek  Int                 @default(1)
+  /// 1-28. Used by MONTHLY.
+  dayOfMonth Int                 @default(1)
+  hour       Int                 @default(9)
+  minute     Int                 @default(0)
+  timezone   String              @default("UTC")
+
+  platform        Platform
+  socialAccountId String?
+  topic           String
+  audience        String?
+  tone            Tone        @default(PROFESSIONAL)
+  contentType     ContentType @default(SOCIAL_POST)
+  keywords        String[]    @default([])
+
+  /// Hard-wired to true: automations may generate, never publish unattended.
+  requiresApproval Boolean @default(true)
+  enabled          Boolean @default(true)
+
+  lastRunAt DateTime?
+  nextRunAt DateTime?
+  runCount  Int       @default(0)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  user          User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  socialAccount SocialAccount?  @relation(fields: [socialAccountId], references: [id], onDelete: SetNull)
+  posts         Post[]
+  runs          AutomationRun[]
+
+  @@index([userId])
+  @@index([enabled, nextRunAt])
+}
+
+model AutomationRun {
+  id           String              @id @default(cuid())
+  automationId String
+  status       AutomationRunStatus @default(RUNNING)
+  postId       String?
+  message      String?             @db.Text
+  startedAt    DateTime            @default(now())
+  finishedAt   DateTime?
+
+  automation Automation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+  post       Post?      @relation(fields: [postId], references: [id], onDelete: SetNull)
+
+  @@index([automationId, startedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Agent (LangGraph) persistence
+// ---------------------------------------------------------------------------
+
+/// One execution of the LangGraph content agent. `threadId` links to checkpoints
+/// so a run can be resumed after a human-in-the-loop interrupt (even across restarts).
+model AgentRun {
+  id          String         @id @default(cuid())
+  threadId    String         @unique
+  userId      String
+  postId      String?
+  status      AgentRunStatus @default(RUNNING)
+  currentNode String?
+  nodeHistory Json?
+  state       Json?
+  error       String?        @db.Text
+  startedAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  finishedAt  DateTime?
+
+  user User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  post Post? @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  @@index([userId, startedAt])
+  @@index([postId])
+}
+
+/// LangGraph checkpoint storage (see src/lib/agent/prisma-checkpointer.ts).
+model AgentCheckpoint {
+  threadId           String
+  checkpointNs       String   @default("")
+  checkpointId       String
+  parentCheckpointId String?
+  type               String?
+  checkpoint         Json
+  metadata           Json
+  createdAt          DateTime @default(now())
+
+  @@id([threadId, checkpointNs, checkpointId])
+  @@index([threadId, checkpointNs, createdAt])
+}
+
+model AgentCheckpointWrite {
+  threadId     String
+  checkpointNs String  @default("")
+  checkpointId String
+  taskId       String
+  idx          Int
+  channel      String
+  type         String?
+  value        Json?
+
+  @@id([threadId, checkpointNs, checkpointId, taskId, idx])
+}
+
+// ---------------------------------------------------------------------------
+// Observability
+// ---------------------------------------------------------------------------
+
+model ActivityLog {
+  id        String       @id @default(cuid())
+  userId    String
+  postId    String?
+  type      ActivityType
+  message   String
+  metadata  Json?
+  createdAt DateTime     @default(now())
+
+  user User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  post Post? @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([postId, createdAt])
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  type      NotificationType
+  title     String
+  body      String?
+  link      String?
+  read      Boolean          @default(false)
+  createdAt DateTime         @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, read, createdAt])
+}
+
+/// Per-post platform metrics. Populated by the demo analytics generator or,
+/// with real credentials, by each platform adapter's insights endpoint.
+model AnalyticsSnapshot {
+  id               String   @id @default(cuid())
+  postId           String
+  platform         Platform
+  capturedAt       DateTime @default(now())
+  impressions      Int      @default(0)
+  reach            Int      @default(0)
+  likes            Int      @default(0)
+  comments         Int      @default(0)
+  shares           Int      @default(0)
+  saves            Int      @default(0)
+  clicks           Int      @default(0)
+  engagementRate   Float    @default(0)
+  clickThroughRate Float    @default(0)
+
+  post Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  @@index([postId, capturedAt])
+  @@index([platform, capturedAt])
+}
